@@ -8,10 +8,10 @@ const { BmadFederatedKnowledge } = require('../index');
 const { ConfigValidator } = require('../schemas/config-validator');
 const fs = require('fs-extra');
 const path = require('path');
-const { spawn } = require('child_process');
 const { registerAddKnowledgeCommand } = require('./add-knowledge-command');
 const { registerConnectionCommands } = require('./connection-commands');
 const { registerSyncDbCommand } = require('./sync-db-command');
+const { flattenRepositoryToXml } = require('../utils/repo-flattener');
 const program = new Command();
 const bmadFed = new BmadFederatedKnowledge();
 const configValidator = new ConfigValidator();
@@ -103,24 +103,25 @@ program
         
         // === 2. Sync database sources ===
         spinner = ora('Syncing all database knowledge sources...').start();
-        
+
         try {
-          // Use the sync-db functionality directly instead of spawning a process
-          const { registerSyncDbCommand } = require('./sync-db-command');
-          
-          // Create a temporary Command instance to capture the sync-db action
-          const tempProgram = new Command();
-          registerSyncDbCommand(tempProgram, bmadFed);
-          
-          // Find the command and execute its action directly
-          const syncDbCommand = tempProgram.commands.find(cmd => cmd.name() === 'sync-db');
-          if (syncDbCommand && syncDbCommand._actionHandler) {
-            // Execute with mock option enabled
-            await syncDbCommand._actionHandler({ all: true, mock: true }, {});
-            spinner.succeed(chalk.green('Database sources sync completed.'));
+          const knowledgeSources = bmadFed.dependencyResolver.config.bmad_config.knowledge_sources || {};
+          const hasDatabaseSources = Object.values(knowledgeSources).some(source => source.type === 'database');
+
+          if (!hasDatabaseSources) {
+            spinner.info(chalk.yellow('No database knowledge sources configured. Skipping database sync.'));
           } else {
-            console.log(chalk.yellow('Could not find sync-db command handler, skipping database sync.'));
-            spinner.info(chalk.yellow('Database sources sync skipped.'));
+            // Use the registered action directly with the expected commander signature.
+            const tempProgram = new Command();
+            registerSyncDbCommand(tempProgram, bmadFed);
+            const syncDbCommand = tempProgram.commands.find(cmd => cmd.name() === 'sync-db');
+
+            if (!syncDbCommand || !syncDbCommand._actionHandler) {
+              spinner.info(chalk.yellow('Could not find sync-db command handler, skipping database sync.'));
+            } else {
+              await syncDbCommand._actionHandler(undefined, { all: true, mock: true });
+              spinner.succeed(chalk.green('Database sources sync completed.'));
+            }
           }
         } catch (err) {
           console.log(chalk.yellow(`Database sync error: ${err.message}`));
@@ -166,32 +167,8 @@ program
 
           console.log(chalk.blue(`\n🔄 Flattening repo "${name}" → ${outputFile}`));
 
-          await new Promise((resolve, reject) => {
-            const child = spawn('npx', ['bmad-method', 'flatten', '-i', cachePath, '-o', outputFile], {
-              shell: true
-            });
-
-            child.stdout.on('data', (data) => {
-              process.stdout.write(chalk.gray(data.toString()));
-              if (data.toString().includes('Completion Summary:')) {
-                setTimeout(() => resolve(), 200);
-              }
-            });
-
-            child.stderr.on('data', (data) => {
-              process.stderr.write(chalk.red(data.toString()));
-            });
-
-            child.on('error', (err) => reject(err));
-            child.on('close', (code) => {
-              if (code !== 0) return reject(new Error(`Flatten failed for ${name}`));
-              resolve();
-            });
-
-            child.stdin.end();
-          });
-
-          console.log(chalk.green(`✓ Flattened ${name} → ${outputFile}`));
+          const result = await flattenRepositoryToXml(cachePath, outputFile);
+          console.log(chalk.green(`✓ Flattened ${name} → ${outputFile} (${result.fileCount} files)`));
 
           // Get description from config if available
           const description = config.metadata?.description || 'No description provided';
